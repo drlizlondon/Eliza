@@ -18,7 +18,18 @@ const statusClassMap = {
   Redirected: "status-redirected",
   "Scheduled Review": "status-scheduled-review",
   "Advice Given": "status-advice-given",
+  Closed: "status-closed",
+  Cancelled: "status-cancelled",
 };
+
+const CLOSE_OUTCOMES = [
+  "Patient admitted",
+  "Advice completed",
+  "Patient reviewed",
+  "No longer required",
+  "Duplicate referral",
+  "Other",
+];
 
 const demoReferrals = [
   {
@@ -258,6 +269,7 @@ const state = {
   referrals: loadState(),
   selectedSpecialty: "Acute Medicine",
   modal: null,
+  gpFilter: "All",
 };
 
 function loadState() {
@@ -332,13 +344,34 @@ function statusBadge(status) {
 }
 
 function waitingText(referral) {
-  const lastEvent = referral.timeline[referral.timeline.length - 1];
-  const minutes = minutesBetween(lastEvent.time, nowIso());
+  if (["Closed", "Cancelled"].includes(referral.status)) return "Completed";
+  const minutes = currentWaitMinutes(referral);
   if (minutes < 1) return "Just now";
   if (minutes < 60) return `${minutes}m`;
   const hours = Math.floor(minutes / 60);
   const remainder = minutes % 60;
   return remainder ? `${hours}h ${remainder}m` : `${hours}h`;
+}
+
+function currentWaitMinutes(referral) {
+  const lastEvent = referral.timeline[referral.timeline.length - 1];
+  return minutesBetween(lastEvent.time, nowIso());
+}
+
+function waitingTone(referral) {
+  if (["Closed", "Cancelled"].includes(referral.status)) return "waiting-neutral";
+  const minutes = currentWaitMinutes(referral);
+  if (minutes < 15) return "waiting-neutral";
+  if (minutes <= 30) return "waiting-amber";
+  return "waiting-red";
+}
+
+function waitingLabel(referral) {
+  if (["Closed", "Cancelled"].includes(referral.status)) return "Outcome recorded";
+  const minutes = currentWaitMinutes(referral);
+  if (minutes < 15) return "Within expected review window";
+  if (minutes <= 30) return "Watch delay";
+  return "Delayed";
 }
 
 function currentPath() {
@@ -361,6 +394,74 @@ function addTimelineEvent(referral, actor, event, kind) {
     event,
     kind,
   });
+}
+
+function getSavedNotes(referral) {
+  return referral.timeline.filter((entry) =>
+    ["gp-update", "requested-info", "accepted", "redirected", "scheduled", "advice"].includes(entry.kind),
+  );
+}
+
+function latestActionSummary(referral) {
+  const latest = referral.timeline[referral.timeline.length - 1];
+  if (!latest) return "";
+  if (latest.kind === "requested-info") return extractAfterColon(latest.event) || "Further information requested";
+  if (latest.kind === "accepted") return extractAfterColon(latest.event) || "Accepted by specialty";
+  if (latest.kind === "advice") return "Review specialty advice";
+  if (latest.kind === "scheduled") return extractAfterColon(latest.event) || "Review planned";
+  if (latest.kind === "redirected") return `Redirected to ${referral.currentSpecialty}`;
+  if (latest.kind === "closed") return latest.event.replace(/^Referral /, "");
+  if (latest.kind === "gp-update") return "New GP information added";
+  return "";
+}
+
+function extractAfterColon(text) {
+  const parts = text.split(":");
+  return parts.length > 1 ? parts.slice(1).join(":").trim() : "";
+}
+
+function statusGroup(referral) {
+  if (referral.status === "Awaiting Review") return 0;
+  if (referral.status === "Awaiting GP Update") return 1;
+  if (["Accepted for Admission", "Scheduled Review", "Advice Given"].includes(referral.status)) return 2;
+  if (referral.status === "Redirected") return 3;
+  if (referral.status === "Closed") return 4;
+  if (referral.status === "Cancelled") return 5;
+  return 6;
+}
+
+function filterGpReferrals(referrals) {
+  const filter = state.gpFilter;
+  if (filter === "All") return referrals;
+  if (filter === "Awaiting Review") return referrals.filter((item) => item.status === "Awaiting Review");
+  if (filter === "Awaiting GP Update") return referrals.filter((item) => item.status === "Awaiting GP Update");
+  if (filter === "Accepted") return referrals.filter((item) => item.status === "Accepted for Admission");
+  if (filter === "Redirected") return referrals.filter((item) => item.routeHistory.length > 1 && item.status === "Awaiting Review");
+  if (filter === "Closed") return referrals.filter((item) => ["Advice Given", "Scheduled Review", "Closed", "Cancelled"].includes(item.status));
+  return referrals;
+}
+
+function pathwaySummary(referral) {
+  const steps = ["GP", ...referral.routeHistory];
+  if (referral.status === "Accepted for Admission") steps.push("Accepted");
+  if (referral.status === "Scheduled Review") steps.push("Scheduled");
+  if (referral.status === "Advice Given") steps.push("Advice");
+  if (referral.status === "Closed" || referral.status === "Cancelled") steps.push(referral.status);
+  return steps.join(" -> ");
+}
+
+function timelineKindLabel(entry) {
+  if (entry.kind === "gp-update" || entry.actor === "GP") return "GP";
+  if (entry.kind === "redirected") return "Redirect";
+  if (["accepted", "scheduled", "advice", "closed"].includes(entry.kind)) return "Outcome";
+  return "Specialty";
+}
+
+function timelineTone(entry) {
+  if (entry.kind === "gp-update" || entry.actor === "GP") return "timeline-gp";
+  if (entry.kind === "redirected") return "timeline-redirect";
+  if (["accepted", "scheduled", "advice", "closed"].includes(entry.kind)) return "timeline-close";
+  return "timeline-specialty";
 }
 
 function ensureFirstResponse(referral) {
@@ -389,6 +490,7 @@ function computeGpMetrics(referrals) {
     ["Scheduled review", referrals.filter((item) => item.status === "Scheduled Review").length],
     ["Advice given", referrals.filter((item) => item.status === "Advice Given").length],
     ["Redirected", referrals.filter((item) => item.routeHistory.length > 1).length],
+    ["Closed", referrals.filter((item) => item.status === "Closed").length],
     ["Average time to first response", avgFirstResponse],
     ["Average time to acceptance", avgAcceptance],
   ];
@@ -443,6 +545,7 @@ function computeSpecialtyMetrics(referrals) {
     ["Advice given", referrals.filter((item) => item.status === "Advice Given").length],
     ["Redirected onwards", referrals.filter((item) => item.timeline.some((entry) => entry.kind === "redirected")).length],
     ["More information requested", referrals.filter((item) => item.status === "Awaiting GP Update").length],
+    ["Closed", referrals.filter((item) => item.status === "Closed").length],
     ["Average time to review", avgReview],
     ["Average time to final outcome", avgOutcome],
   ];
@@ -516,13 +619,17 @@ function mostCommonPhrase(events) {
 
 function dashboardSummary(referrals, mode) {
   if (mode === "gp") {
-    const open = referrals.filter((item) => ["Awaiting Review", "Awaiting GP Update"].includes(item.status)).length;
-    const redirected = referrals.filter((item) => item.routeHistory.length > 1).length;
-    const advice = referrals.filter((item) => item.status === "Advice Given").length;
+    const madeToday = referrals.filter((item) => {
+      const created = new Date(item.createdAt);
+      const now = new Date();
+      return created.toDateString() === now.toDateString();
+    }).length;
+    const awaitingReview = referrals.filter((item) => item.status === "Awaiting Review").length;
+    const awaitingGpUpdate = referrals.filter((item) => item.status === "Awaiting GP Update").length;
     return [
-      ["Live referrals", open],
-      ["Redirects logged", redirected],
-      ["Advice outcomes", advice],
+      ["Referrals made today", madeToday],
+      ["Awaiting first review", awaitingReview],
+      ["Awaiting GP update", awaitingGpUpdate],
       ["Audit trail coverage", "100%"],
     ];
   }
@@ -534,7 +641,7 @@ function dashboardSummary(referrals, mode) {
     ["Awaiting review", awaiting],
     ["Awaiting GP update", updates],
     ["Closed with action", outcomes],
-    ["Over 30 mins", over30],
+    ["Delayed", over30],
   ];
 }
 
@@ -610,6 +717,20 @@ function handleGpUpdate(referralId, text) {
   navigate(`/gp/referral/${referralId}`);
 }
 
+function handleCloseReferral(referralId, payload = {}, actorMode = "gp") {
+  const referral = findReferral(referralId);
+  if (!referral) return;
+  const actor = actorMode === "gp" ? "GP" : referral.currentSpecialty;
+  const outcome = payload.outcome || "Other";
+  const note = payload.note ? ` Note: ${payload.note}` : "";
+  referral.status = ["No longer required", "Duplicate referral"].includes(outcome) ? "Cancelled" : "Closed";
+  addTimelineEvent(referral, actor, `Referral ${referral.status.toLowerCase()}: ${outcome}.${note}`, "closed");
+  markFinalOutcome(referral);
+  saveState();
+  closeModal();
+  navigate(`/${actorMode === "gp" ? "gp" : "specialty"}/referral/${referralId}`);
+}
+
 function handleSpecialtyAction(referralId, action, payload = {}) {
   const referral = findReferral(referralId);
   if (!referral) return;
@@ -662,6 +783,11 @@ function handleSpecialtyAction(referralId, action, payload = {}) {
     markFinalOutcome(referral);
   }
 
+  if (action === "close") {
+    handleCloseReferral(referralId, payload, "specialty");
+    return;
+  }
+
   saveState();
   closeModal();
   navigate(`/specialty/referral/${referralId}`);
@@ -678,10 +804,10 @@ function renderNav(path) {
   return `
     <div class="nav">
       <a class="brand" href="#/">
-        <div class="brand-mark">C</div>
+        <div class="brand-mark">E</div>
         <div class="brand-text">
           <strong>ELIZA</strong>
-          <span>Acute referral management MVP</span>
+          <span>Acute referral visibility</span>
         </div>
       </a>
       <div class="nav-links">
@@ -700,95 +826,58 @@ function renderNav(path) {
 function renderHome() {
   return `
     <section class="hero">
-      <div class="panel hero-copy">
-        <span class="eyebrow">Acute referral flow, made visible</span>
-        <h1>ELIZA</h1>
+      <div class="panel hero-copy hero-copy-wide">
+        <span class="eyebrow">Acute referral visibility</span>
         <p class="hero-tagline">Acute referrals, without the chaos.</p>
-        <p class="lead">Send the referral. Track the response. See where it went.</p>
+        <p class="lead">See where referrals go, how long they wait, and what decision was made.</p>
+        <p class="inline-note hero-strapline">No lost referrals. No unclear pathways. No endless referral chasing.</p>
+        <p class="hero-credibility">Designed around real acute referral workflow friction experienced in frontline care.</p>
         <div class="hero-actions">
-          <a class="button" href="#/gp">GP Demo</a>
-          <a class="ghost-button" href="#/specialty">Specialty Demo</a>
-          <a class="ghost-button" href="#/audit/gp">View Audit</a>
-        </div>
-        <div class="problem-list">
-          <div class="problem-item">Can’t get through to the specialty registrar?</div>
-          <div class="problem-item">Patient arrived with no proof of referral?</div>
-          <div class="problem-item">Wrong specialty? Redirect without losing the trail.</div>
-          <div class="problem-item">Need to audit delays, redirects and outcomes?</div>
-        </div>
-      </div>
-      <div class="panel hero-side">
-        <div class="demo-stack">
-          <div class="demo-card">
-            <div class="demo-card-header">
-              <strong>Shared workflow</strong>
-              ${statusBadge("Awaiting Review")}
-            </div>
-            <p class="lead">ELIZA helps GPs and hospital teams manage acute referrals in one shared workflow. GPs add the patient to the specialty list. Specialty teams review, accept, redirect, request more information, schedule review, or give advice. Every step is logged.</p>
-          </div>
-          <div class="demo-card">
-            <div class="demo-card-header">
-              <strong>What it looks like</strong>
-              <span class="waiting-pill">Live demo data</span>
-            </div>
-            <div class="timeline">
-              <div class="timeline-item">
-                <strong>13:02 Referral submitted to Orthopaedics</strong>
-                <span class="timeline-meta">GP view and specialty list update instantly</span>
-              </div>
-              <div class="timeline-item">
-                <strong>13:24 Redirected to Rheumatology</strong>
-                <span class="timeline-meta">No lost messages, no restart, full audit trail</span>
-              </div>
-              <div class="timeline-item">
-                <strong>13:31 More information requested</strong>
-                <span class="timeline-meta">GP sees exactly what is needed next</span>
-              </div>
-            </div>
-          </div>
+          <a class="button" href="#/gp">View GP Workflow</a>
+          <a class="ghost-button" href="#/specialty">View Specialty Workflow</a>
+          <a class="ghost-button" href="#/audit/gp">View Audit Trail</a>
         </div>
       </div>
     </section>
     <div class="section-header">
-      <h2 class="section-title">Why ELIZA works well</h2>
-      <p class="section-subtitle">Built to make sense in seconds for acute pathways, while still feeling like a governance tool rather than just another inbox.</p>
+      <h2 class="section-title">Operational pain points ELIZA addresses</h2>
     </div>
     <section class="feature-grid">
-      <div class="feature-card">
-        <span class="eyebrow">For GPs</span>
-        <h3>One place to send and track</h3>
-        <p class="lead">Every referral has a mandatory reason, visible status badge and a live timeline you can show to the patient if needed.</p>
-      </div>
-      <div class="feature-card">
-        <span class="eyebrow">For Specialties</span>
-        <h3>Five clear actions, no clutter</h3>
-        <p class="lead">Accept, ask for more, redirect, schedule review or give advice. The flow stays consistent and the dashboard stays calm.</p>
-      </div>
-      <div class="feature-card">
-        <span class="eyebrow">For Governance</span>
-        <h3>Audit trail by default</h3>
-        <p class="lead">Delays, redirects and outcomes are all time-stamped, making quality improvement visible from day one.</p>
-      </div>
+      <div class="feature-card"><div class="feature-icon">◷</div><h3>Patient arrived but no referral recorded</h3><p>Visible submission and referral history reduce uncertainty once the patient reaches hospital.</p></div>
+      <div class="feature-card"><div class="feature-icon">↺</div><h3>Wrong specialty received the referral</h3><p>Redirection remains visible without losing the original pathway or timestamps.</p></div>
+      <div class="feature-card"><div class="feature-icon">◌</div><h3>No visibility on referral delays</h3><p>Waiting time becomes visible across teams instead of being buried in switchboard chasing.</p></div>
+      <div class="feature-card"><div class="feature-icon">!</div><h3>Referral redirected with no audit trail</h3><p>Every review, redirect and response is written into a single referral record.</p></div>
+      <div class="feature-card"><div class="feature-icon">◔</div><h3>GP unsure whether specialty has seen referral</h3><p>Reviewed and accepted states are visible without requiring phone confirmation.</p></div>
+      <div class="feature-card"><div class="feature-icon">→</div><h3>Referral outcome unclear after phone advice</h3><p>Advice, review plans and closure outcomes can be recorded in the same workflow.</p></div>
     </section>
   `;
 }
 
 function renderGpDashboard() {
-  const referrals = [...state.referrals].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-  const summary = dashboardSummary(referrals, "gp");
+  const referrals = filterGpReferrals(
+    [...state.referrals].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)),
+  );
+  const summary = dashboardSummary(state.referrals, "gp");
+  const filters = ["All", "Awaiting Review", "Awaiting GP Update", "Accepted", "Redirected", "Closed"];
 
   return `
     <div class="page-header">
       <div>
         <span class="eyebrow">GP Dashboard</span>
         <h1 class="page-title">Acute Referral Dashboard</h1>
-        <p class="page-intro">A clear record of acute referrals sent, their current destination and the latest specialty response. Select any referral to review the full audit trail.</p>
       </div>
       <a class="button" href="#/gp/new">+ Add New Referral</a>
     </div>
     <section class="summary-grid">
       ${summary.map(([label, value]) => `<div class="summary-chip"><strong>${value}</strong><span>${label}</span></div>`).join("")}
     </section>
+    <div class="filter-bar">
+      ${filters
+        .map(
+          (filter) => `<button class="filter-chip ${state.gpFilter === filter ? "active" : ""}" data-gp-filter="${filter}">${filter}</button>`,
+        )
+        .join("")}
+    </div>
     <section class="table-card">
       <table class="data-table">
         <thead>
@@ -814,17 +903,18 @@ function renderGpDashboard() {
                   </td>
                   <td>
                     <div class="cell-stack">
-                      ${redirected ? `<span>Redirected</span><strong>${referral.currentSpecialty}</strong>` : `<strong>${referral.currentSpecialty}</strong>`}
+                      ${redirected ? `<span class="mini-label">Redirected</span><div class="specialty-primary">${referral.currentSpecialty}</div>` : `<div class="specialty-primary">${referral.currentSpecialty}</div>`}
                     </div>
                   </td>
                   <td>
                     <div class="cell-stack">
-                      <strong>${textPreview(referral.reason)}</strong>
+                      <span class="reason-preview">${textPreview(referral.reason, 72)}</span>
                     </div>
                   </td>
-                  <td>
+                  <td class="status-cell">
                     <div class="status-stack">
                       ${statusBadge(referral.status)}
+                      ${latestActionSummary(referral) ? `<span class="status-subtext">${latestActionSummary(referral)}</span>` : ""}
                     </div>
                   </td>
                 </tr>
@@ -899,12 +989,14 @@ function renderReferralDetail(referral, mode) {
     mode === "gp"
       ? "Further clinical information may be added at any time. Each update is time-stamped and recorded within the referral audit trail."
       : "Use the specialty actions below to record the next clinical decision. Each action updates status and writes directly to the audit trail.";
+  const savedNotes = getSavedNotes(referral);
 
   const actionPanel =
     mode === "gp"
       ? `
         <div class="detail-actions">
           <button class="button" data-gp-update="${referral.id}">Add More Information</button>
+          <button class="ghost-button" data-gp-close="${referral.id}">Close Referral</button>
           <a class="ghost-button" href="#/gp">Back to GP Dashboard</a>
         </div>
       `
@@ -913,25 +1005,29 @@ function renderReferralDetail(referral, mode) {
           <a class="ghost-button" href="#/specialty">Back to Specialty Dashboard</a>
         </div>
         <div class="action-grid">
-          <button class="action-button" data-specialty-action="accepted" data-referral-id="${referral.id}">
+          <button class="action-button action-primary" data-specialty-action="accepted" data-referral-id="${referral.id}">
             <strong>Accept for Admission</strong>
-            <span>Change status and optionally add an instruction.</span>
+            <span>Record acceptance and immediate destination.</span>
           </button>
-          <button class="action-button" data-specialty-action="request-info" data-referral-id="${referral.id}">
+          <button class="action-button action-secondary" data-specialty-action="request-info" data-referral-id="${referral.id}">
             <strong>Request More Information</strong>
-            <span>Ask the GP for the missing detail.</span>
+            <span>Request specific clinical detail.</span>
           </button>
-          <button class="action-button" data-specialty-action="redirect" data-referral-id="${referral.id}">
-            <strong>Redirect</strong>
-            <span>Send to another specialty without losing the trail.</span>
+          <button class="action-button action-secondary" data-specialty-action="redirect" data-referral-id="${referral.id}">
+            <strong>Refer to Another Specialty</strong>
+            <span>Transfer without losing the audit trail.</span>
           </button>
-          <button class="action-button" data-specialty-action="scheduled" data-referral-id="${referral.id}">
+          <button class="action-button action-tertiary" data-specialty-action="scheduled" data-referral-id="${referral.id}">
             <strong>Scheduled Review</strong>
-            <span>Log a planned review time or location.</span>
+            <span>Record the planned review step.</span>
           </button>
-          <button class="action-button" data-specialty-action="advice" data-referral-id="${referral.id}">
+          <button class="action-button action-tertiary" data-specialty-action="advice" data-referral-id="${referral.id}">
             <strong>Advice Given</strong>
-            <span>Close with guidance for the GP or ward team.</span>
+            <span>Document specialty advice.</span>
+          </button>
+          <button class="action-button action-tertiary" data-specialty-action="close" data-referral-id="${referral.id}">
+            <strong>Close Referral</strong>
+            <span>Complete the referral with an outcome.</span>
           </button>
         </div>
       `;
@@ -947,6 +1043,7 @@ function renderReferralDetail(referral, mode) {
     </div>
     <section class="detail-grid">
       <div class="content-card">
+        <div class="pathway-summary">${pathwaySummary(referral)}</div>
         <div class="info-grid">
           <div>
             <span class="label">Patient</span>
@@ -984,21 +1081,40 @@ function renderReferralDetail(referral, mode) {
           </div>
         </div>
         <div class="info-grid">
+          <div>
+            <span class="label">Saved comments and updates</span>
+            <div class="value">
+              ${
+                savedNotes.length
+                  ? savedNotes
+                      .slice()
+                      .reverse()
+                      .map(
+                        (entry) =>
+                          `<div class="saved-note"><strong>${entry.actor}</strong><span>${entry.event}</span><small>${formatDateTime(entry.time)}</small></div>`,
+                      )
+                      .join("")
+                  : `<span class="muted">No comments or free-text updates have been saved yet.</span>`
+              }
+            </div>
+          </div>
+        </div>
+        <div class="info-grid">
           <div>${actionPanel}</div>
         </div>
       </div>
       <div class="timeline-card">
         <div class="title-row">
           <div>
-            <span class="label">Timeline / audit trail</span>
-            <div class="value">Every status change and update is logged.</div>
+            <span class="label">Audit trail</span>
           </div>
         </div>
         <div class="timeline">
           ${referral.timeline
             .map(
               (entry) => `
-                <div class="timeline-item">
+                <div class="timeline-item ${timelineTone(entry)}">
+                  <span class="timeline-kind">${timelineKindLabel(entry)}</span>
                   <strong>${timeOnly(entry.time)} ${entry.event}</strong>
                   <span class="timeline-meta">${formatDateTime(entry.time)} • ${entry.actor}</span>
                 </div>
@@ -1012,7 +1128,11 @@ function renderReferralDetail(referral, mode) {
 }
 
 function renderSpecialtyDashboard() {
-  const referrals = getSpecialtyReferrals().sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  const referrals = getSpecialtyReferrals().sort((a, b) => {
+    const statusDiff = statusGroup(a) - statusGroup(b);
+    if (statusDiff !== 0) return statusDiff;
+    return currentWaitMinutes(b) - currentWaitMinutes(a);
+  });
   const summary = dashboardSummary(referrals, "specialty");
 
   return `
@@ -1020,7 +1140,6 @@ function renderSpecialtyDashboard() {
       <div>
         <span class="eyebrow">Specialty Dashboard</span>
         <h1 class="page-title">Specialty Referral List</h1>
-        <p class="page-intro">This list shows acute referrals currently assigned to the selected specialty. Open any referral to review the full history and record the next outcome.</p>
       </div>
       <div class="segmented">
         ${SPECIALTIES.map(
@@ -1059,9 +1178,9 @@ function renderSpecialtyDashboard() {
                         </div>
                       </td>
                       <td><div class="cell-stack"><strong>${referral.referralType}</strong></div></td>
-                      <td><div class="cell-stack"><strong>${textPreview(referral.reason)}</strong></div></td>
-                      <td>${statusBadge(referral.status)}</td>
-                      <td><span class="waiting-pill">${waitingText(referral)}</span></td>
+                      <td><div class="cell-stack"><span class="reason-preview">${textPreview(referral.reason, 72)}</span></div></td>
+                      <td class="status-cell"><div class="status-stack">${statusBadge(referral.status)}${latestActionSummary(referral) ? `<span class="status-subtext">${latestActionSummary(referral)}</span>` : ""}</div></td>
+                      <td><div class="waiting-stack"><span class="waiting-pill ${waitingTone(referral)}">${waitingText(referral)}</span><span class="waiting-caption">${waitingLabel(referral)}</span></div></td>
                     </tr>
                   `,
                   )
@@ -1088,24 +1207,36 @@ function renderAudit(mode) {
   const referrals = mode === "gp" ? state.referrals : getSpecialtyAuditReferrals();
   const metrics = mode === "gp" ? computeGpMetrics(referrals) : computeSpecialtyMetrics(referrals);
   const insights = mode === "gp" ? computeGpInsights(referrals) : computeSpecialtyInsights(referrals);
+  const delayedReferrals = referrals
+    .filter((item) => currentWaitMinutes(item) > 30)
+    .sort((a, b) => currentWaitMinutes(b) - currentWaitMinutes(a))
+    .slice(0, 4);
+  const redirectPathways = countBy(
+    referrals.filter((item) => item.routeHistory.length > 1).map((item) => item.routeHistory.join(" -> ")),
+  );
+  const responseMins = referrals.filter((item) => item.firstResponseAt).map((item) => minutesBetween(item.createdAt, item.firstResponseAt));
+  const averageResponse = responseMins.length ? Math.round(responseMins.reduce((sum, value) => sum + value, 0) / responseMins.length) : 0;
+  const trendTone = averageResponse > 30 ? "alert-text" : averageResponse > 15 ? "watch-text" : "ok-text";
   const title = mode === "gp" ? "GP Audit" : `${state.selectedSpecialty} Audit`;
   const intro =
     mode === "gp"
-      ? "This view supports quality improvement by summarising referral volumes, response times, redirects and waiting referrals."
-      : "This view supports service review by summarising response times, onward redirection, requests for further information and referral outcomes.";
+      ? "Operational view of referral flow, delays, redirects and outcomes."
+      : "Operational review of specialty response, onward redirection and delayed referrals.";
+  const selector =
+    mode === "specialty"
+      ? `<div class="page-header-side"><div class="segmented">${SPECIALTIES.map(
+          (specialty) => `<button class="segment-button ${state.selectedSpecialty === specialty ? "active" : ""}" data-specialty-select="${specialty}">${specialty}</button>`,
+        ).join("")}</div></div>`
+      : `<div class="page-header-side"><a class="ghost-button" href="#/gp">Back to GP Dashboard</a></div>`;
 
   return `
-    <div class="page-header">
-      <div>
+    <div class="page-header page-header-split">
+      <div class="page-header-main">
         <span class="eyebrow">${mode === "gp" ? "GP Audit Page" : "Specialty Audit Page"}</span>
         <h1 class="page-title">${title}</h1>
         <p class="page-intro">${intro}</p>
       </div>
-      ${mode === "specialty"
-        ? `<div class="segmented">${SPECIALTIES.map(
-            (specialty) => `<button class="segment-button ${state.selectedSpecialty === specialty ? "active" : ""}" data-specialty-select="${specialty}">${specialty}</button>`,
-          ).join("")}</div>`
-        : `<a class="ghost-button" href="#/gp">Back to GP Dashboard</a>`}
+      ${selector}
     </div>
     <section class="metrics-grid">
       ${metrics.map(([label, value]) => `<div class="metric-card"><span>${label}</span><strong>${value}</strong></div>`).join("")}
@@ -1113,8 +1244,7 @@ function renderAudit(mode) {
     <section class="audit-layout">
       <div class="content-card">
         <div class="section-header">
-          <h2 class="section-title">Learning insights</h2>
-          <p class="section-subtitle">A lightweight governance layer for the demo workflow.</p>
+          <h2 class="section-title">Operational insights</h2>
         </div>
         <div class="insight-grid">
           ${insights.map(([label, value]) => `<div class="insight-item"><strong>${label}</strong><span>${value}</span></div>`).join("")}
@@ -1122,21 +1252,56 @@ function renderAudit(mode) {
       </div>
       <div class="timeline-card">
         <div class="section-header">
-          <h2 class="section-title">What this proves</h2>
-          <p class="section-subtitle">The same data can support day-to-day flow and retrospective review.</p>
+          <h2 class="section-title">Delay watch</h2>
+        </div>
+        <div class="alert-card ${trendTone}">
+          <strong>Average first response</strong>
+          <span>${averageResponse ? `${averageResponse} min` : "No response data"}</span>
+        </div>
+        <div class="delay-list">
+          ${
+            delayedReferrals.length
+              ? delayedReferrals
+                  .map(
+                    (referral) => `<div class="delay-item"><strong>${referral.patientName}</strong><span>${referral.currentSpecialty}</span><span class="waiting-pill ${waitingTone(referral)}">${waitingText(referral)}</span></div>`,
+                  )
+                  .join("")
+              : `<span class="muted">No referrals currently over 30 minutes.</span>`
+          }
+        </div>
+      </div>
+    </section>
+    <section class="audit-layout audit-layout-secondary">
+      <div class="content-card">
+        <div class="section-header">
+          <h2 class="section-title">Wait trends</h2>
+        </div>
+        <div class="insight-grid">
+          <div class="insight-item"><strong>Average wait trend</strong><span>${averageResponse ? `${averageResponse} min first response` : "Insufficient data"}</span></div>
+          <div class="insight-item"><strong>Delayed referrals</strong><span>${delayedReferrals.length ? `${delayedReferrals.length} currently over 30 mins` : "No current delay signal"}</span></div>
+          <div class="insight-item"><strong>Most redirected specialties</strong><span>${topLabel(countBy(referrals.filter((item) => item.routeHistory.length > 1).map((item) => item.initialSpecialty)))}</span></div>
+          <div class="insight-item"><strong>Common redirect pathways</strong><span>${topLabel(redirectPathways)}</span></div>
+        </div>
+      </div>
+      <div class="timeline-card">
+        <div class="section-header">
+          <h2 class="section-title">Governance markers</h2>
         </div>
         <div class="timeline">
-          <div class="timeline-item">
-            <strong>Shared source of truth</strong>
-            <span class="timeline-meta">GP and specialty views reflect the same referral state.</span>
+          <div class="timeline-item timeline-specialty">
+            <span class="timeline-kind">Flow</span>
+            <strong>Shared referral state</strong>
+            <span class="timeline-meta">GP and specialty teams see the same pathway history.</span>
           </div>
-          <div class="timeline-item">
-            <strong>Actions create governance data</strong>
-            <span class="timeline-meta">Redirects, delays and outcomes are measured automatically.</span>
+          <div class="timeline-item timeline-redirect">
+            <span class="timeline-kind">Redirect</span>
+            <strong>Redirect pathways visible</strong>
+            <span class="timeline-meta">Misrouted referrals can be tracked rather than lost.</span>
           </div>
-          <div class="timeline-item">
-            <strong>Useful even without full EPR integration</strong>
-            <span class="timeline-meta">This MVP already demonstrates auditability and clarity.</span>
+          <div class="timeline-item timeline-close">
+            <span class="timeline-kind">Close</span>
+            <strong>Referral closure recorded</strong>
+            <span class="timeline-meta">Closed and cancelled referrals now carry an explicit outcome.</span>
           </div>
         </div>
       </div>
@@ -1159,7 +1324,8 @@ function renderModal() {
           <form id="gp-update-form">
             <label class="field full">
               <span class="label">Clinical update</span>
-              <textarea name="note" placeholder="e.g. CRP 212. Patient now tachycardic." required></textarea>
+              <textarea name="note" placeholder="e.g. CRP 212. Patient now tachycardic." required autofocus></textarea>
+              <span class="helper">This text will be saved to the referral record and audit trail.</span>
             </label>
             <div class="modal-footer">
               <button class="button" type="submit">Save information</button>
@@ -1202,9 +1368,9 @@ function renderModal() {
 
   if (type === "redirect") {
     return modalForm({
-      title: "Redirect Referral",
+      title: "Refer to Another Specialty",
       description: "Transfer the referral to another specialty while preserving the complete audit trail.",
-      submitLabel: "Confirm redirect",
+      submitLabel: "Save referral",
       required: true,
       fields: `
         <label class="field full">
@@ -1253,6 +1419,26 @@ function renderModal() {
     });
   }
 
+  if (type === "close") {
+    return modalForm({
+      title: "Close Referral",
+      description: "Record the referral outcome and close the workflow.",
+      submitLabel: "Save closure",
+      fields: `
+        <label class="field full">
+          <span class="label">Outcome</span>
+          <select name="outcome" required>
+            ${CLOSE_OUTCOMES.map((item) => `<option value="${item}">${item}</option>`).join("")}
+          </select>
+        </label>
+        <label class="field full">
+          <span class="label">Outcome note (optional)</span>
+          <textarea name="note" placeholder="Add any closing detail if needed."></textarea>
+        </label>
+      `,
+    });
+  }
+
   return "";
 }
 
@@ -1264,6 +1450,7 @@ function modalForm({ title, description, fields, submitLabel }) {
         <p>${description}</p>
         <form id="specialty-action-form">
           ${fields}
+          <p class="helper">Any text entered here will be saved into the referral record and displayed in the audit trail.</p>
           <div class="modal-footer">
             <button class="button" type="submit">${submitLabel}</button>
             <button class="ghost-button" type="button" data-close-modal="true">Cancel</button>
@@ -1295,7 +1482,9 @@ function renderApp() {
       ${renderNav(path)}
       ${content}
       <footer class="footer">
-        Demo only. No real patient data. Not connected to NHS systems.
+        Demo only. No real patient data.
+        <br />
+        Concept workflow prototype for acute referral pathway visibility.
       </footer>
     </div>
     ${renderModal()}
@@ -1335,6 +1524,17 @@ function bindEvents() {
     });
   });
 
+  document.querySelectorAll("[data-gp-filter]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.gpFilter = button.dataset.gpFilter;
+      render();
+    });
+  });
+
+  document.querySelectorAll("[data-gp-close]").forEach((button) => {
+    button.addEventListener("click", () => openModal({ type: "close", referralId: button.dataset.gpClose, actorMode: "gp" }));
+  });
+
   document.querySelectorAll("[data-close-modal]").forEach((element) => {
     element.addEventListener("click", (event) => {
       if (event.target === element || element.dataset.closeModal === "true") {
@@ -1355,6 +1555,7 @@ function bindEvents() {
     const payload = {
       note: (formData.get("note") || "").trim(),
       specialty: formData.get("specialty"),
+      outcome: formData.get("outcome"),
     };
 
     if (["request-info", "scheduled", "advice"].includes(state.modal.type) && !payload.note) {
@@ -1364,6 +1565,16 @@ function bindEvents() {
 
     if (state.modal.type === "redirect" && !payload.specialty) {
       alert("Please choose the new specialty.");
+      return;
+    }
+
+    if (state.modal.type === "close" && !payload.outcome) {
+      alert("Please select the closure outcome.");
+      return;
+    }
+
+    if (state.modal.type === "close") {
+      handleCloseReferral(state.modal.referralId, payload, state.modal.actorMode || "specialty");
       return;
     }
 
