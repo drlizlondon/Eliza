@@ -4,10 +4,10 @@ Simple clickable MVP for acute referral management with local demo state only.
 
 ## Run locally
 
-Open [index.html](/Users/lizzie/Documents/Codex%20Cleo/index.html) directly in a browser for a quick preview, or serve the folder locally:
+Open [index.html](/Users/lizzie/Documents/Codex%20Eliza/index.html) directly in a browser for a quick preview, or serve the folder locally:
 
 ```bash
-cd "/Users/lizzie/Documents/Codex Cleo"
+cd "/Users/lizzie/Documents/Codex Eliza"
 python3 -m http.server 4173
 ```
 
